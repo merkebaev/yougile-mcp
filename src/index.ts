@@ -72,7 +72,7 @@ function toHtml(txt: string): string {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.3.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.4.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -241,11 +241,12 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
   },
   async ({ taskId, stickerId, stateId }) => {
-    const data = await api("PUT", `/string-stickers/${stickerId}/states/${stateId}`, {
-      taskId
+    // Стикеры передаются через PUT /tasks/{id} в поле stickers: { stickerId: stateId }
+    const data = await api("PUT", `/tasks/${taskId}`, {
+      stickers: { [stickerId]: stateId }
     }) as { id?: string; error?: string; message?: string };
 
-    if (data.id || JSON.stringify(data) === "{}") {
+    if (data.id) {
       return text(`✓ Стикер установлен на задаче ${taskId}`);
     }
     return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
@@ -266,11 +267,12 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
   },
   async ({ taskId, sprintStickerId, sprintStateId }) => {
-    const data = await api("PUT", `/sprint-stickers/${sprintStickerId}/states/${sprintStateId}`, {
-      taskId
+    // Спринтовые стикеры тоже передаются через PUT /tasks/{id} в поле stickers
+    const data = await api("PUT", `/tasks/${taskId}`, {
+      stickers: { [sprintStickerId]: sprintStateId }
     }) as { id?: string; error?: string; message?: string };
 
-    if (data.id || JSON.stringify(data) === "{}") {
+    if (data.id) {
       return text(`✓ Задача ${taskId} назначена на спринт`);
     }
     return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
@@ -462,7 +464,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.3.0" });
+    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.4.0" });
   });
 
   app.post("/mcp", async (req, res) => {
@@ -477,7 +479,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.3 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.4 запущен на порту ${PORT}`);
   });
 }
 
