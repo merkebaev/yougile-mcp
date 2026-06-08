@@ -4,7 +4,6 @@ import express from "express";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
-import FormData from "form-data";
 
 const YOUGILE_KEY = process.env.YOUGILE_KEY || "";
 const BASE = "https://ru.yougile.com/api-v2";
@@ -26,16 +25,17 @@ async function api(method: string, path: string, body?: unknown): Promise<unknow
 // Загрузка файла (multipart/form-data)
 async function uploadFile(filePath: string): Promise<{ url: string; fullUrl: string } | null> {
   try {
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileName = path.basename(filePath);
     const form = new FormData();
-    form.append("file", fs.createReadStream(filePath), path.basename(filePath));
+    form.append("file", new Blob([fileBuffer]), fileName);
 
     const res = await fetch(`${BASE}/upload-file`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${YOUGILE_KEY}`,
-        ...form.getHeaders()
+        "Authorization": `Bearer ${YOUGILE_KEY}`
       },
-      body: form as unknown as BodyInit
+      body: form
     });
     const data = await res.json() as { url?: string; fullUrl?: string };
     if (data.fullUrl) return { url: data.url!, fullUrl: data.fullUrl };
