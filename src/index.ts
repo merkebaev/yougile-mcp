@@ -8,13 +8,20 @@ const BASE = "https://ru.yougile.com/api-v2";
 // --- API helpers ---
 
 async function api(method: string, path: string, body?: unknown): Promise<unknown> {
+  // Используем ручную сериализацию чтобы сохранить реальные \n в строках
+  let bodyStr: string | undefined;
+  if (body) {
+    bodyStr = JSON.stringify(body);
+    // JSON.stringify экранирует \n как \\n — возвращаем реальные переносы
+    bodyStr = bodyStr.replace(/\\n/g, "\n");
+  }
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${YOUGILE_KEY}`
     },
-    ...(body ? { body: JSON.stringify(body) } : {})
+    ...(bodyStr ? { body: bodyStr } : {})
   });
   return res.json();
 }
@@ -59,7 +66,7 @@ function dateToTimestamp(dateStr: string): number {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.1.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.2.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -371,7 +378,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.1 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.2 запущен на порту ${PORT}`);
   });
 }
 
