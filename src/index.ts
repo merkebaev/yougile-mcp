@@ -61,18 +61,24 @@ function dateToTimestamp(dateStr: string): number {
   return new Date(dateStr + "T12:00:00.000Z").getTime();
 }
 
+// Оборачивает URL в кликабельные ссылки
+function linkify(text: string): string {
+  return text.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1">$1</a>');
+}
+
 // Конвертация текста с \n в HTML для поля description
 function toHtml(txt: string): string {
   return txt.split("\n").map(line => {
-    if (/^\d+\.\s/.test(line)) return `<p style="margin:0 0 4px 16px">${line}</p>`;
+    const linked = linkify(line);
+    if (/^\d+\.\s/.test(line)) return `<p style="margin:0 0 4px 16px">${linked}</p>`;
     if (line.trim() === "") return `<p style="margin:8px 0"></p>`;
-    return `<p style="margin:0 0 4px">${line}</p>`;
+    return `<p style="margin:0 0 4px">${linked}</p>`;
   }).join("");
 }
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.4.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.5.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -464,7 +470,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.4.0" });
+    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.5.0" });
   });
 
   app.post("/mcp", async (req, res) => {
@@ -479,7 +485,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.4 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.5 запущен на порту ${PORT}`);
   });
 }
 
