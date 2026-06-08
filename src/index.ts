@@ -8,11 +8,9 @@ const BASE = "https://ru.yougile.com/api-v2";
 // --- API helpers ---
 
 async function api(method: string, path: string, body?: unknown): Promise<unknown> {
-  // Используем ручную сериализацию чтобы сохранить реальные \n в строках
   let bodyStr: string | undefined;
   if (body) {
     bodyStr = JSON.stringify(body);
-    // JSON.stringify экранирует \n как \\n — возвращаем реальные переносы
     bodyStr = bodyStr.replace(/\\n/g, "\n");
   }
   const res = await fetch(`${BASE}${path}`, {
@@ -59,14 +57,22 @@ function formatDate(ts: number | undefined): string {
   return new Date(ts).toISOString().split("T")[0];
 }
 
-// Конвертация YYYY-MM-DD в timestamp (ms)
 function dateToTimestamp(dateStr: string): number {
   return new Date(dateStr + "T12:00:00.000Z").getTime();
 }
 
+// Конвертация текста с \n в HTML для поля description
+function toHtml(txt: string): string {
+  return txt.split("\n").map(line => {
+    if (/^\d+\.\s/.test(line)) return `<p style="margin:0 0 4px 16px">${line}</p>`;
+    if (line.trim() === "") return `<p style="margin:8px 0"></p>`;
+    return `<p style="margin:0 0 4px">${line}</p>`;
+  }).join("");
+}
+
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.2.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.3.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -131,7 +137,7 @@ server.registerTool(
   "yougile_list_tasks",
   {
     title: "Задачи в колонке",
-    description: "Получить список задач из конкретной колонки YouGile с датой создания, дедлайном и исполнителем.",
+    description: "Получить список задач из конкретной колонки YouGile с датой создания, дедлайном, исполнителем и стикерами.",
     inputSchema: z.object({
       columnId: z.string().describe("ID колонки из yougile_list_columns")
     }).strict(),
@@ -145,6 +151,7 @@ server.registerTool(
         deadline?: { deadline?: number };
         timestamp?: number;
         assigned?: string[];
+        stickers?: Record<string, string>;
       }>
     };
     const tasks = data.content || [];
@@ -154,20 +161,121 @@ server.registerTool(
       if (t.timestamp) row += ` | создана: ${formatDate(t.timestamp)}`;
       if (t.deadline?.deadline) row += ` | дедлайн: ${formatDate(t.deadline.deadline)}`;
       if (t.assigned?.length) row += ` | исполнители: ${t.assigned.join(", ")}`;
+      if (t.stickers && Object.keys(t.stickers).length) {
+        const stickerStr = Object.entries(t.stickers).map(([k, v]) => `${k}:${v}`).join(", ");
+        row += ` | стикеры: ${stickerStr}`;
+      }
       return row;
     }).join("\n");
     return text(`Задачи (${tasks.length}):\n${list}`);
   }
 );
 
-// Конвертация текста с \n в HTML для поля description
-function toHtml(txt: string): string {
-  return txt.split("\n").map(line => {
-    if (/^\d+\.\s/.test(line)) return `<p style="margin:0 0 4px 16px">${line}</p>`;
-    if (line.trim() === "") return `<p style="margin:8px 0"></p>`;
-    return `<p style="margin:0 0 4px">${line}</p>`;
-  }).join("");
-}
+// Получить стикеры компании (кастомные и спринтовые)
+server.registerTool(
+  "yougile_list_stickers",
+  {
+    title: "Список стикеров",
+    description: "Получить все кастомные (string) и спринтовые стикеры компании. Возвращает ID стикеров и их состояний — нужны для yougile_set_sticker и yougile_set_sprint.",
+    inputSchema: z.object({}).strict(),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  },
+  async () => {
+    const [stringData, sprintData] = await Promise.all([
+      api("GET", "/string-stickers?limit=100") as Promise<{
+        content?: Array<{ id: string; name: string; states?: Array<{ id: string; name: string; color?: string }> }>
+      }>,
+      api("GET", "/sprint-stickers?limit=100") as Promise<{
+        content?: Array<{ id: string; name: string; states?: Array<{ id: string; name: string; begin?: number; end?: number }> }>
+      }>
+    ]);
+
+    const lines: string[] = [];
+
+    const stringStickers = (stringData as { content?: Array<{ id: string; name: string; states?: Array<{ id: string; name: string; color?: string }> }> }).content || [];
+    if (stringStickers.length) {
+      lines.push("Кастомные стикеры (string-stickers):");
+      for (const s of stringStickers) {
+        lines.push(`  • ${s.name} [stickerId: ${s.id}]`);
+        if (s.states?.length) {
+          for (const st of s.states) {
+            lines.push(`      - ${st.name} [stateId: ${st.id}]${st.color ? ` (${st.color})` : ""}`);
+          }
+        }
+      }
+    }
+
+    const sprintStickers = (sprintData as { content?: Array<{ id: string; name: string; states?: Array<{ id: string; name: string; begin?: number; end?: number }> }> }).content || [];
+    if (sprintStickers.length) {
+      if (lines.length) lines.push("");
+      lines.push("Спринтовые стикеры:");
+      for (const s of sprintStickers) {
+        lines.push(`  • ${s.name} [stickerId: ${s.id}]`);
+        if (s.states?.length) {
+          for (const st of s.states) {
+            let sprintLine = `      - ${st.name} [stateId: ${st.id}]`;
+            if (st.begin) sprintLine += ` | начало: ${formatDate(st.begin * 1000)}`;
+            if (st.end) sprintLine += ` | конец: ${formatDate(st.end * 1000)}`;
+            lines.push(sprintLine);
+          }
+        }
+      }
+    }
+
+    if (!lines.length) return text("Стикеры не найдены");
+    return text(lines.join("\n"));
+  }
+);
+
+// Установить значение кастомного стикера на задаче
+server.registerTool(
+  "yougile_set_sticker",
+  {
+    title: "Установить стикер на задаче",
+    description: "Установить значение кастомного string-стикера на задаче (например: Приоритет = Высокий). ID стикера и состояния берутся из yougile_list_stickers.",
+    inputSchema: z.object({
+      taskId: z.string().describe("ID задачи"),
+      stickerId: z.string().describe("ID стикера из yougile_list_stickers"),
+      stateId: z.string().describe("ID состояния стикера из yougile_list_stickers")
+    }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  },
+  async ({ taskId, stickerId, stateId }) => {
+    const data = await api("PUT", `/string-stickers/${stickerId}/states/${stateId}`, {
+      taskId
+    }) as { id?: string; error?: string; message?: string };
+
+    if (data.id || JSON.stringify(data) === "{}") {
+      return text(`✓ Стикер установлен на задаче ${taskId}`);
+    }
+    return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
+  }
+);
+
+// Назначить задачу на спринт
+server.registerTool(
+  "yougile_set_sprint",
+  {
+    title: "Назначить задачу на спринт",
+    description: "Назначить задачу на спринт. ID спринтового стикера и состояния (спринта) берутся из yougile_list_stickers.",
+    inputSchema: z.object({
+      taskId: z.string().describe("ID задачи"),
+      sprintStickerId: z.string().describe("ID спринтового стикера из yougile_list_stickers"),
+      sprintStateId: z.string().describe("ID конкретного спринта (состояния) из yougile_list_stickers")
+    }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  },
+  async ({ taskId, sprintStickerId, sprintStateId }) => {
+    const data = await api("PUT", `/sprint-stickers/${sprintStickerId}/states/${sprintStateId}`, {
+      taskId
+    }) as { id?: string; error?: string; message?: string };
+
+    if (data.id || JSON.stringify(data) === "{}") {
+      return text(`✓ Задача ${taskId} назначена на спринт`);
+    }
+    return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
+  }
+);
 
 // Создать задачу
 server.registerTool(
@@ -191,7 +299,6 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
   },
   async ({ columnId, title, description, priority, deadline, assignee, assignees }) => {
-    // Собираем список исполнителей
     const assignedIds: string[] = [];
     if (assignees?.length) assignedIds.push(...assignees);
     else if (assignee) assignedIds.push(assignee);
@@ -199,14 +306,9 @@ server.registerTool(
     const body: Record<string, unknown> = { title, columnId };
 
     if (description) body.description = toHtml(description);
-
-    // Исполнители — массив ID
     if (assignedIds.length) body.assigned = assignedIds;
-
-    // Дедлайн — timestamp в миллисекундах
     if (deadline) body.deadline = { deadline: dateToTimestamp(deadline) };
 
-    // Приоритет — цвет карточки (самый надёжный способ без ID стикеров)
     if (priority) {
       const colorMap: Record<string, string> = {
         "Важно": "task-red",
@@ -251,16 +353,13 @@ server.registerTool(
     if (description) body.description = toHtml(description);
     if (columnId) body.columnId = columnId;
 
-    // Исполнители — массив
     const assignedIds: string[] = [];
     if (assignees?.length) assignedIds.push(...assignees);
     else if (assignee) assignedIds.push(assignee);
     if (assignedIds.length) body.assigned = assignedIds;
 
-    // Дедлайн — timestamp в миллисекундах
     if (deadline) body.deadline = { deadline: dateToTimestamp(deadline) };
 
-    // Приоритет через цвет карточки
     if (priority) {
       const colorMap: Record<string, string> = {
         "Важно": "task-red",
@@ -363,7 +462,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "YouGile MCP Server", version: "3.0.0" });
+    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.3.0" });
   });
 
   app.post("/mcp", async (req, res) => {
@@ -378,7 +477,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.2 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.3 запущен на порту ${PORT}`);
   });
 }
 
