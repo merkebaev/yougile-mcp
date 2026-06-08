@@ -59,7 +59,7 @@ function dateToTimestamp(dateStr: string): number {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.0.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.1.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -153,6 +153,15 @@ server.registerTool(
   }
 );
 
+// Конвертация текста с \n в HTML для поля description
+function toHtml(txt: string): string {
+  return txt.split("\n").map(line => {
+    if (/^\d+\.\s/.test(line)) return `<p style="margin:0 0 4px 16px">${line}</p>`;
+    if (line.trim() === "") return `<p style="margin:8px 0"></p>`;
+    return `<p style="margin:0 0 4px">${line}</p>`;
+  }).join("");
+}
+
 // Создать задачу
 server.registerTool(
   "yougile_create_task",
@@ -182,7 +191,7 @@ server.registerTool(
 
     const body: Record<string, unknown> = { title, columnId };
 
-    if (description) body.description = description;
+    if (description) body.description = toHtml(description);
 
     // Исполнители — массив ID
     if (assignedIds.length) body.assigned = assignedIds;
@@ -232,7 +241,7 @@ server.registerTool(
     const body: Record<string, unknown> = {};
 
     if (title) body.title = title;
-    if (description) body.description = description;
+    if (description) body.description = toHtml(description);
     if (columnId) body.columnId = columnId;
 
     // Исполнители — массив
@@ -362,7 +371,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.0 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.1 запущен на порту ${PORT}`);
   });
 }
 
