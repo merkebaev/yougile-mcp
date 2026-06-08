@@ -2,9 +2,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
-import * as fs from "fs";
-import * as path from "path";
-
 const YOUGILE_KEY = process.env.YOUGILE_KEY || "";
 const BASE = "https://ru.yougile.com/api-v2";
 
@@ -22,19 +19,20 @@ async function api(method: string, path: string, body?: unknown): Promise<unknow
   return res.json();
 }
 
-// Загрузка файла (multipart/form-data)
-async function uploadFile(filePath: string): Promise<{ url: string; fullUrl: string } | null> {
+// Загрузка файла из base64 (multipart/form-data)
+async function uploadFileBase64(
+  base64: string,
+  fileName: string,
+  mimeType: string
+): Promise<{ url: string; fullUrl: string } | null> {
   try {
-    const fileBuffer = fs.readFileSync(filePath);
-    const fileName = path.basename(filePath);
+    const buffer = Buffer.from(base64, "base64");
     const form = new FormData();
-    form.append("file", new Blob([fileBuffer]), fileName);
+    form.append("file", new Blob([buffer], { type: mimeType }), fileName);
 
     const res = await fetch(`${BASE}/upload-file`, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${YOUGILE_KEY}`
-      },
+      headers: { "Authorization": `Bearer ${YOUGILE_KEY}` },
       body: form
     });
     const data = await res.json() as { url?: string; fullUrl?: string };
@@ -61,7 +59,7 @@ function dateToTimestamp(dateStr: string): number {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "3.0.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.0.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -311,35 +309,32 @@ server.registerTool(
   }
 );
 
-// Загрузить файл/изображение и прикрепить к задаче через чат
+// Загрузить изображение (base64) и прикрепить к задаче через чат
 server.registerTool(
   "yougile_upload_image",
   {
     title: "Загрузить изображение в задачу",
-    description: "Загружает изображение на сервер YouGile и отправляет его в чат задачи как сообщение с картинкой.",
+    description: "Загружает изображение на сервер YouGile и отправляет его в чат задачи. Принимает изображение в формате base64.",
     inputSchema: z.object({
       taskId: z.string().describe("ID задачи"),
-      filePath: z.string().describe("Абсолютный путь к файлу изображения на сервере"),
+      imageBase64: z.string().describe("Содержимое изображения в формате base64 (без префикса data:...)"),
+      fileName: z.string().describe("Имя файла, например screenshot.jpg"),
+      mimeType: z.string().default("image/jpeg").describe("MIME-тип файла: image/jpeg, image/png и т.д."),
       caption: z.string().optional().describe("Подпись к изображению")
     }).strict(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
   },
-  async ({ taskId, filePath, caption }) => {
-    // Загружаем файл
-    const uploaded = await uploadFile(filePath);
-    if (!uploaded) return text("Ошибка: не удалось загрузить файл");
+  async ({ taskId, imageBase64, fileName, mimeType, caption }) => {
+    const uploaded = await uploadFileBase64(imageBase64, fileName, mimeType);
+    if (!uploaded) return text("Ошибка: не удалось загрузить изображение на сервер YouGile");
 
-    const cap = caption || path.basename(filePath);
+    const cap = caption || fileName;
     const msgText = `📎 ${cap}: ${uploaded.fullUrl}`;
     const msgHtml = `<p>${cap}</p><img src="${uploaded.fullUrl}" alt="${cap}" style="max-width:100%;" />`;
 
-    const body = {
-      text: msgText,
-      textHtml: msgHtml,
-      label: ""
-    };
-
+    const body = { text: msgText, textHtml: msgHtml, label: "" };
     const data = await api("POST", `/chats/${taskId}/messages`, body) as { id?: number; error?: string; message?: string };
+
     if (data.id) return text(`✓ Изображение загружено и отправлено в чат\nURL: ${uploaded.fullUrl}`);
     return text(`Файл загружен (${uploaded.fullUrl}), но ошибка отправки в чат: ${data.error || data.message || JSON.stringify(data)}`);
   }
@@ -367,7 +362,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v3.0 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.0 запущен на порту ${PORT}`);
   });
 }
 
