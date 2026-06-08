@@ -2,10 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
+import * as fs from "fs";
+import * as path from "path";
+import FormData from "form-data";
 
 const YOUGILE_KEY = process.env.YOUGILE_KEY || "";
 const BASE = "https://ru.yougile.com/api-v2";
-const BASE_V1 = "https://yougile.com/data/api-v1";
 
 // --- API helpers ---
 
@@ -21,42 +23,45 @@ async function api(method: string, path: string, body?: unknown): Promise<unknow
   return res.json();
 }
 
-async function apiv1(method: string, path: string, body?: unknown): Promise<unknown> {
-  const res = await fetch(`${BASE_V1}${path}`, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `YOUGILE-KEY ${YOUGILE_KEY}`
-    },
-    ...(body ? { body: JSON.stringify(body) } : {})
-  });
-  return res.json();
+// Загрузка файла (multipart/form-data)
+async function uploadFile(filePath: string): Promise<{ url: string; fullUrl: string } | null> {
+  try {
+    const form = new FormData();
+    form.append("file", fs.createReadStream(filePath), path.basename(filePath));
+
+    const res = await fetch(`${BASE}/upload-file`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${YOUGILE_KEY}`,
+        ...form.getHeaders()
+      },
+      body: form as unknown as BodyInit
+    });
+    const data = await res.json() as { url?: string; fullUrl?: string };
+    if (data.fullUrl) return { url: data.url!, fullUrl: data.fullUrl };
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function text(data: unknown): { content: Array<{ type: "text"; text: string }> } {
   return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
 }
 
-// Форматирование дедлайна — может прийти строка или объект {timestamp}
-function formatDeadline(deadline: unknown): string {
-  if (!deadline) return "";
-  if (typeof deadline === "string") return deadline;
-  if (typeof deadline === "object" && deadline !== null && "timestamp" in deadline) {
-    const ts = (deadline as { timestamp: number }).timestamp;
-    return new Date(ts).toISOString().split("T")[0];
-  }
-  return "";
-}
-
-// Форматирование даты из timestamp
 function formatDate(ts: number | undefined): string {
   if (!ts) return "";
   return new Date(ts).toISOString().split("T")[0];
 }
 
+// Конвертация YYYY-MM-DD в timestamp (ms)
+function dateToTimestamp(dateStr: string): number {
+  return new Date(dateStr + "T12:00:00.000Z").getTime();
+}
+
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "2.0.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "3.0.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -132,10 +137,9 @@ server.registerTool(
       content?: Array<{
         id: string;
         title: string;
-        deadline?: unknown;
+        deadline?: { deadline?: number };
         timestamp?: number;
         assigned?: string[];
-        createdBy?: string;
       }>
     };
     const tasks = data.content || [];
@@ -143,8 +147,7 @@ server.registerTool(
     const list = tasks.map(t => {
       let row = `• ${t.title} [id: ${t.id}]`;
       if (t.timestamp) row += ` | создана: ${formatDate(t.timestamp)}`;
-      const dl = formatDeadline(t.deadline);
-      if (dl) row += ` | дедлайн: ${dl}`;
+      if (t.deadline?.deadline) row += ` | дедлайн: ${formatDate(t.deadline.deadline)}`;
       if (t.assigned?.length) row += ` | исполнители: ${t.assigned.join(", ")}`;
       return row;
     }).join("\n");
@@ -159,28 +162,45 @@ server.registerTool(
     title: "Создать задачу",
     description: `Создать новую задачу в колонке YouGile через v2 API.
 Требует columnId (из yougile_list_columns) и title.
-Приоритет через stickers: Важно | Нормально | Не важно.
-Дедлайн в формате YYYY-MM-DD.`,
+Приоритет: Важно | Нормально | Не важно.
+Дедлайн в формате YYYY-MM-DD.
+Исполнитель: ID пользователя из yougile_list_users.`,
     inputSchema: z.object({
       columnId: z.string().describe("ID колонки куда добавить задачу"),
       title: z.string().min(1).max(255).describe("Название задачи"),
       description: z.string().optional().describe("Описание задачи"),
       priority: z.enum(["Важно", "Нормально", "Не важно"]).optional().describe("Приоритет задачи"),
       deadline: z.string().optional().describe("Дедлайн в формате YYYY-MM-DD"),
-      assignee: z.string().optional().describe("ID пользователя (из yougile_list_users)")
+      assignee: z.string().optional().describe("ID пользователя (из yougile_list_users)"),
+      assignees: z.array(z.string()).optional().describe("Массив ID пользователей для назначения нескольких исполнителей")
     }).strict(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
   },
-  async ({ columnId, title, description, priority, deadline, assignee }) => {
-    // v2 API для создания задачи
-    const body: Record<string, unknown> = {
-      title,
-      columnId,
-      stickers: priority ? { "Приоритет": { name: priority } } : undefined
-    };
+  async ({ columnId, title, description, priority, deadline, assignee, assignees }) => {
+    // Собираем список исполнителей
+    const assignedIds: string[] = [];
+    if (assignees?.length) assignedIds.push(...assignees);
+    else if (assignee) assignedIds.push(assignee);
+
+    const body: Record<string, unknown> = { title, columnId };
+
     if (description) body.description = description;
-    if (deadline) body.deadline = { deadline, time: false };
-    if (assignee) body.assigned = { [assignee]: true };
+
+    // Исполнители — массив ID
+    if (assignedIds.length) body.assigned = assignedIds;
+
+    // Дедлайн — timestamp в миллисекундах
+    if (deadline) body.deadline = { deadline: dateToTimestamp(deadline) };
+
+    // Приоритет — цвет карточки (самый надёжный способ без ID стикеров)
+    if (priority) {
+      const colorMap: Record<string, string> = {
+        "Важно": "task-red",
+        "Нормально": "task-yellow",
+        "Не важно": "task-blue"
+      };
+      body.color = colorMap[priority];
+    }
 
     const data = await api("POST", "/tasks", body) as { id?: string; error?: string; message?: string };
 
@@ -188,21 +208,7 @@ server.registerTool(
       return text(`✓ Задача создана!\nНазвание: ${title}\nID: ${data.id}`);
     }
 
-    // Fallback на v1 если v2 не сработал
-    const bodyV1: Record<string, unknown> = {
-      title,
-      location: columnId,
-      stringStickers: { "Приоритет": priority || "Нормально" }
-    };
-    if (description) bodyV1.description = description;
-    if (deadline) bodyV1.deadline = deadline;
-    if (assignee) bodyV1.assigned = assignee;
-
-    const dataV1 = await apiv1("POST", "/tasks", bodyV1) as { result: string; id?: string; error?: string };
-    if (dataV1.result === "ok") {
-      return text(`✓ Задача создана!\nНазвание: ${title}\nID: ${dataV1.id}`);
-    }
-    return text(`Ошибка: ${data.error || data.message || dataV1.error || JSON.stringify(data)}`);
+    return text(`Ошибка создания задачи: ${data.error || data.message || JSON.stringify(data)}`);
   }
 );
 
@@ -211,28 +217,49 @@ server.registerTool(
   "yougile_update_task",
   {
     title: "Обновить задачу",
-    description: "Обновить существующую задачу в YouGile. Можно менять название, описание, приоритет, дедлайн, колонку.",
+    description: "Обновить существующую задачу в YouGile. Можно менять название, описание, приоритет, дедлайн, колонку, исполнителей.",
     inputSchema: z.object({
       taskId: z.string().describe("ID задачи которую нужно обновить"),
       title: z.string().optional().describe("Новое название"),
       description: z.string().optional().describe("Новое описание"),
       priority: z.enum(["Важно", "Нормально", "Не важно"]).optional().describe("Новый приоритет"),
       deadline: z.string().optional().describe("Новый дедлайн YYYY-MM-DD"),
-      columnId: z.string().optional().describe("Переместить в другую колонку")
+      columnId: z.string().optional().describe("Переместить в другую колонку"),
+      assignee: z.string().optional().describe("ID пользователя для назначения"),
+      assignees: z.array(z.string()).optional().describe("Массив ID пользователей")
     }).strict(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
   },
-  async ({ taskId, title, description, priority, deadline, columnId }) => {
-    const body: Record<string, unknown> = { id: taskId };
+  async ({ taskId, title, description, priority, deadline, columnId, assignee, assignees }) => {
+    const body: Record<string, unknown> = {};
+
     if (title) body.title = title;
     if (description) body.description = description;
-    if (priority) body.stringStickers = { "Приоритет": priority };
-    if (deadline) body.deadline = deadline;
-    if (columnId) body.location = columnId;
+    if (columnId) body.columnId = columnId;
 
-    const data = await apiv1("PUT", "/tasks", body) as { result: string; id?: string; error?: string };
-    if (data.result === "ok") return text(`✓ Задача ${taskId} обновлена`);
-    return text(`Ошибка: ${data.error || JSON.stringify(data)}`);
+    // Исполнители — массив
+    const assignedIds: string[] = [];
+    if (assignees?.length) assignedIds.push(...assignees);
+    else if (assignee) assignedIds.push(assignee);
+    if (assignedIds.length) body.assigned = assignedIds;
+
+    // Дедлайн — timestamp в миллисекундах
+    if (deadline) body.deadline = { deadline: dateToTimestamp(deadline) };
+
+    // Приоритет через цвет карточки
+    if (priority) {
+      const colorMap: Record<string, string> = {
+        "Важно": "task-red",
+        "Нормально": "task-yellow",
+        "Не важно": "task-blue"
+      };
+      body.color = colorMap[priority];
+    }
+
+    const data = await api("PUT", `/tasks/${taskId}`, body) as { id?: string; error?: string; message?: string };
+
+    if (data.id) return text(`✓ Задача ${taskId} обновлена`);
+    return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
   }
 );
 
@@ -264,22 +291,57 @@ server.registerTool(
   "yougile_send_message",
   {
     title: "Сообщение в задачу",
-    description: "Отправить сообщение в чат задачи YouGile.",
+    description: "Отправить сообщение в чат задачи YouGile. Поддерживает HTML для форматирования и вставки изображений.",
     inputSchema: z.object({
       taskId: z.string().describe("ID задачи"),
-      text: z.string().min(1).describe("Текст сообщения")
+      text: z.string().min(1).describe("Текст сообщения"),
+      textHtml: z.string().optional().describe("Текст в формате HTML (поддерживает <img src='...'> для отображения картинок)")
     }).strict(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
   },
-  async ({ taskId, text: msgText }) => {
-    // Сначала пробуем v2
-    const dataV2 = await api("POST", `/tasks/${taskId}/chat`, { text: msgText }) as { id?: string; error?: string };
-    if (dataV2.id) return text(`✓ Сообщение отправлено`);
+  async ({ taskId, text: msgText, textHtml }) => {
+    const body = {
+      text: msgText,
+      textHtml: textHtml || `<p>${msgText}</p>`,
+      label: ""
+    };
+    const data = await api("POST", `/chats/${taskId}/messages`, body) as { id?: number; error?: string; message?: string };
+    if (data.id) return text(`✓ Сообщение отправлено (id: ${data.id})`);
+    return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
+  }
+);
 
-    // Fallback на v1
-    const dataV1 = await apiv1("POST", "/messages", { taskId, text: msgText }) as { result: string; error?: string };
-    if (dataV1.result === "ok") return text(`✓ Сообщение отправлено`);
-    return text(`Ошибка: ${dataV1.error || JSON.stringify(dataV1)}`);
+// Загрузить файл/изображение и прикрепить к задаче через чат
+server.registerTool(
+  "yougile_upload_image",
+  {
+    title: "Загрузить изображение в задачу",
+    description: "Загружает изображение на сервер YouGile и отправляет его в чат задачи как сообщение с картинкой.",
+    inputSchema: z.object({
+      taskId: z.string().describe("ID задачи"),
+      filePath: z.string().describe("Абсолютный путь к файлу изображения на сервере"),
+      caption: z.string().optional().describe("Подпись к изображению")
+    }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+  },
+  async ({ taskId, filePath, caption }) => {
+    // Загружаем файл
+    const uploaded = await uploadFile(filePath);
+    if (!uploaded) return text("Ошибка: не удалось загрузить файл");
+
+    const cap = caption || path.basename(filePath);
+    const msgText = `📎 ${cap}: ${uploaded.fullUrl}`;
+    const msgHtml = `<p>${cap}</p><img src="${uploaded.fullUrl}" alt="${cap}" style="max-width:100%;" />`;
+
+    const body = {
+      text: msgText,
+      textHtml: msgHtml,
+      label: ""
+    };
+
+    const data = await api("POST", `/chats/${taskId}/messages`, body) as { id?: number; error?: string; message?: string };
+    if (data.id) return text(`✓ Изображение загружено и отправлено в чат\nURL: ${uploaded.fullUrl}`);
+    return text(`Файл загружен (${uploaded.fullUrl}), но ошибка отправки в чат: ${data.error || data.message || JSON.stringify(data)}`);
   }
 );
 
@@ -290,7 +352,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "YouGile MCP Server", version: "2.0.0" });
+    res.json({ status: "ok", service: "YouGile MCP Server", version: "3.0.0" });
   });
 
   app.post("/mcp", async (req, res) => {
@@ -305,7 +367,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v2.0 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v3.0 запущен на порту ${PORT}`);
   });
 }
 
