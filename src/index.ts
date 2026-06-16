@@ -78,7 +78,7 @@ function toHtml(txt: string): string {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.5.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.6.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -174,6 +174,84 @@ server.registerTool(
       return row;
     }).join("\n");
     return text(`Задачи (${tasks.length}):\n${list}`);
+  }
+);
+
+
+// Получить детали одной задачи по ID
+server.registerTool(
+  "yougile_get_task",
+  {
+    title: "Детали задачи",
+    description: "Получить полную информацию по задаче YouGile: название, описание (plain text), приоритет, дедлайн, исполнителей, стикеры. Нужен taskId из yougile_list_tasks.",
+    inputSchema: z.object({
+      taskId: z.string().describe("ID задачи из yougile_list_tasks")
+    }).strict(),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  },
+  async ({ taskId }) => {
+    const data = await api("GET", `/tasks/${taskId}`) as {
+      id?: string;
+      title?: string;
+      description?: string;
+      color?: string;
+      deadline?: { deadline?: number };
+      timestamp?: number;
+      assigned?: string[];
+      stickers?: Record<string, string>;
+      completed?: boolean;
+      error?: string;
+      message?: string;
+    };
+
+    if (!data.id) {
+      return text(`Ошибка: ${data.error || data.message || "Задача не найдена"}`);
+    }
+
+    function htmlToPlain(html: string): string {
+      return html
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<p[^>]*>/gi, "")
+        .replace(/<li[^>]*>/gi, "- ")
+        .replace(/<\/li>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    }
+
+    const colorMap: Record<string, string> = {
+      "task-red": "Важно",
+      "task-yellow": "Нормально",
+      "task-blue": "Не важно"
+    };
+
+    const lines: string[] = [];
+    lines.push(`Задача: ${data.title}`);
+    lines.push(`ID: ${data.id}`);
+    if (data.timestamp) lines.push(`Создана: ${formatDate(data.timestamp)}`);
+    if (data.deadline?.deadline) lines.push(`Дедлайн: ${formatDate(data.deadline.deadline)}`);
+    if (data.color) lines.push(`Приоритет: ${colorMap[data.color] || data.color}`);
+    if (data.completed !== undefined) lines.push(`Завершена: ${data.completed ? "да" : "нет"}`);
+    if (data.assigned?.length) lines.push(`Исполнители: ${data.assigned.join(", ")}`);
+    if (data.stickers && Object.keys(data.stickers).length) {
+      const stickerStr = Object.entries(data.stickers).map(([k, v]) => `${k}:${v}`).join(", ");
+      lines.push(`Стикеры: ${stickerStr}`);
+    }
+    lines.push("");
+    if (data.description) {
+      lines.push("ОПИСАНИЕ:");
+      lines.push(htmlToPlain(data.description));
+    } else {
+      lines.push("ОПИСАНИЕ: (пусто)");
+    }
+
+    return text(lines.join("\n"));
   }
 );
 
@@ -470,7 +548,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.5.0" });
+    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.6.0" });
   });
 
   app.post("/mcp", async (req, res) => {
@@ -485,7 +563,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.5 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.6 запущен на порту ${PORT}`);
   });
 }
 
