@@ -4,6 +4,8 @@ import express from "express";
 import { z } from "zod";
 const YOUGILE_KEY = process.env.YOUGILE_KEY || "";
 const BASE = "https://ru.yougile.com/api-v2";
+// ID компании — используется для сборки ссылок вида https://yougile.com/team/{TEAM_ID}/#ID-1997
+const TEAM_ID = process.env.YOUGILE_TEAM_ID || "d004349a7770";
 
 // --- API helpers ---
 
@@ -52,6 +54,22 @@ function text(data: unknown): { content: Array<{ type: "text"; text: string }> }
   return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
 }
 
+// Ссылка на задачу по её сквозному номеру (idTaskCommon, вида "ID-1997")
+function taskLink(idTaskCommon: string | undefined): string {
+  if (!idTaskCommon) return "";
+  return `https://yougile.com/team/${TEAM_ID}/#${idTaskCommon}`;
+}
+
+// POST /tasks возвращает только UUID. Номер и ссылку добираем отдельным GET.
+async function fetchTaskCode(uuid: string): Promise<{ code?: string; codeProject?: string }> {
+  try {
+    const t = await api("GET", `/tasks/${uuid}`) as { idTaskCommon?: string; idTaskProject?: string };
+    return { code: t.idTaskCommon, codeProject: t.idTaskProject };
+  } catch {
+    return {};
+  }
+}
+
 function formatDate(ts: number | undefined): string {
   if (!ts) return "";
   return new Date(ts).toISOString().split("T")[0];
@@ -78,7 +96,7 @@ function toHtml(txt: string): string {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.6.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.7.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -153,6 +171,7 @@ server.registerTool(
     const data = await api("GET", `/tasks?columnId=${columnId}&limit=100`) as {
       content?: Array<{
         id: string;
+        idTaskCommon?: string;
         title: string;
         deadline?: { deadline?: number };
         timestamp?: number;
@@ -163,7 +182,7 @@ server.registerTool(
     const tasks = data.content || [];
     if (!tasks.length) return text("Задачи не найдены");
     const list = tasks.map(t => {
-      let row = `• ${t.title} [id: ${t.id}]`;
+      let row = `• ${t.title} [${t.idTaskCommon || "—"}] [id: ${t.id}]`;
       if (t.timestamp) row += ` | создана: ${formatDate(t.timestamp)}`;
       if (t.deadline?.deadline) row += ` | дедлайн: ${formatDate(t.deadline.deadline)}`;
       if (t.assigned?.length) row += ` | исполнители: ${t.assigned.join(", ")}`;
@@ -192,6 +211,8 @@ server.registerTool(
   async ({ taskId }) => {
     const data = await api("GET", `/tasks/${taskId}`) as {
       id?: string;
+      idTaskCommon?: string;
+      idTaskProject?: string;
       title?: string;
       description?: string;
       color?: string;
@@ -233,6 +254,9 @@ server.registerTool(
 
     const lines: string[] = [];
     lines.push(`Задача: ${data.title}`);
+    if (data.idTaskCommon) lines.push(`Номер: ${data.idTaskCommon}`);
+    if (data.idTaskProject) lines.push(`Номер в проекте: ${data.idTaskProject}`);
+    if (data.idTaskCommon) lines.push(`Ссылка: ${taskLink(data.idTaskCommon)}`);
     lines.push(`ID: ${data.id}`);
     if (data.timestamp) lines.push(`Создана: ${formatDate(data.timestamp)}`);
     if (data.deadline?.deadline) lines.push(`Дедлайн: ${formatDate(data.deadline.deadline)}`);
@@ -407,7 +431,13 @@ server.registerTool(
     const data = await api("POST", "/tasks", body) as { id?: string; error?: string; message?: string };
 
     if (data.id) {
-      return text(`✓ Задача создана!\nНазвание: ${title}\nID: ${data.id}`);
+      const { code, codeProject } = await fetchTaskCode(data.id);
+      const out = [`✓ Задача создана!`, `Название: ${title}`];
+      if (code) out.push(`Номер: ${code}`);
+      if (codeProject) out.push(`Номер в проекте: ${codeProject}`);
+      if (code) out.push(`Ссылка: ${taskLink(code)}`);
+      out.push(`ID: ${data.id}`);
+      return text(out.join("\n"));
     }
 
     return text(`Ошибка создания задачи: ${data.error || data.message || JSON.stringify(data)}`);
@@ -457,7 +487,30 @@ server.registerTool(
 
     const data = await api("PUT", `/tasks/${taskId}`, body) as { id?: string; error?: string; message?: string };
 
-    if (data.id) return text(`✓ Задача ${taskId} обновлена`);
+    if (data.id) {
+      const { code } = await fetchTaskCode(data.id);
+      if (code) return text(`✓ Задача ${code} обновлена\nСсылка: ${taskLink(code)}`);
+      return text(`✓ Задача ${taskId} обновлена`);
+    }
+    return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
+  }
+);
+
+// Удалить задачу
+server.registerTool(
+  "yougile_delete_task",
+  {
+    title: "Удалить задачу",
+    description: "Удалить задачу в YouGile (помечает объект как удалённый). Действие необратимо через API. Требует явного подтверждения: confirm должен быть true.",
+    inputSchema: z.object({
+      taskId: z.string().describe("ID задачи (UUID или номер вида ID-1997)"),
+      confirm: z.literal(true).describe("Подтверждение удаления. Должно быть true.")
+    }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
+  },
+  async ({ taskId }) => {
+    const data = await api("PUT", `/tasks/${taskId}`, { deleted: true }) as { id?: string; error?: string; message?: string };
+    if (data.id) return text(`✓ Задача ${taskId} удалена`);
     return text(`Ошибка: ${data.error || data.message || JSON.stringify(data)}`);
   }
 );
@@ -548,7 +601,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.6.0" });
+    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.7.0" });
   });
 
   app.post("/mcp", async (req, res) => {
@@ -563,7 +616,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.6 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.7 запущен на порту ${PORT}`);
   });
 }
 
