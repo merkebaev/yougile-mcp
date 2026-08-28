@@ -70,6 +70,47 @@ async function fetchTaskCode(uuid: string): Promise<{ code?: string; codeProject
   }
 }
 
+// --- Карта стикеров (для расшифровки UUID в названия) ---
+
+type StickerMap = Map<string, { name: string; states: Map<string, string> }>;
+let stickerCache: { map: StickerMap; loadedAt: number } | null = null;
+const STICKER_TTL_MS = 10 * 60 * 1000;
+
+async function getStickerMap(): Promise<StickerMap> {
+  if (stickerCache && Date.now() - stickerCache.loadedAt < STICKER_TTL_MS) {
+    return stickerCache.map;
+  }
+  const map: StickerMap = new Map();
+  try {
+    const [stringData, sprintData] = await Promise.all([
+      api("GET", "/string-stickers?limit=100"),
+      api("GET", "/sprint-stickers?limit=100")
+    ]) as Array<{ content?: Array<{ id: string; name: string; states?: Array<{ id: string; name: string }> }> }>;
+
+    for (const src of [stringData, sprintData]) {
+      for (const s of src.content || []) {
+        const states = new Map<string, string>();
+        for (const st of s.states || []) states.set(st.id, st.name);
+        map.set(s.id, { name: s.name, states });
+      }
+    }
+    stickerCache = { map, loadedAt: Date.now() };
+  } catch {
+    // при сбое отдаём пустую карту — вывод деградирует до сырых ID, но не падает
+  }
+  return map;
+}
+
+// "414b1e9c-...:6e212266facc" -> "Приоритет: Высокий"
+function describeStickers(stickers: Record<string, string> | undefined, map: StickerMap): string {
+  if (!stickers || !Object.keys(stickers).length) return "";
+  return Object.entries(stickers).map(([sid, stid]) => {
+    const s = map.get(sid);
+    if (!s) return `${sid}:${stid}`;
+    return `${s.name}: ${s.states.get(stid) || stid}`;
+  }).join(", ");
+}
+
 function formatDate(ts: number | undefined): string {
   if (!ts) return "";
   return new Date(ts).toISOString().split("T")[0];
@@ -96,7 +137,7 @@ function toHtml(txt: string): string {
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "yougile-mcp-server", version: "4.7.0" });
+const server = new McpServer({ name: "yougile-mcp-server", version: "4.8.0" });
 
 // Получить список проектов
 server.registerTool(
@@ -160,25 +201,46 @@ server.registerTool(
 server.registerTool(
   "yougile_list_tasks",
   {
-    title: "Задачи в колонке",
-    description: "Получить список задач из конкретной колонки YouGile с датой создания, дедлайном, исполнителем и стикерами.",
+    title: "Задачи",
+    description: `Получить список задач YouGile с датой создания, дедлайном, исполнителем и стикерами.
+Фильтры комбинируются. Нужен хотя бы один из: columnId, stickerId, assignedTo, titleContains.
+Чтобы вытащить все задачи одного типа (например Тех.долг) — передай stickerId и stickerStateId из yougile_list_stickers, без columnId.`,
     inputSchema: z.object({
-      columnId: z.string().describe("ID колонки из yougile_list_columns")
+      columnId: z.string().optional().describe("ID колонки из yougile_list_columns"),
+      stickerId: z.string().optional().describe("ID стикера для фильтрации (из yougile_list_stickers)"),
+      stickerStateId: z.string().optional().describe("ID состояния стикера, например конкретный тип или приоритет"),
+      assignedTo: z.string().optional().describe("ID исполнителя, несколько — через запятую"),
+      titleContains: z.string().optional().describe("Фильтр по заголовку задачи")
     }).strict(),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
   },
-  async ({ columnId }) => {
-    const data = await api("GET", `/tasks?columnId=${columnId}&limit=100`) as {
-      content?: Array<{
-        id: string;
-        idTaskCommon?: string;
-        title: string;
-        deadline?: { deadline?: number };
-        timestamp?: number;
-        assigned?: string[];
-        stickers?: Record<string, string>;
-      }>
-    };
+  async ({ columnId, stickerId, stickerStateId, assignedTo, titleContains }) => {
+    if (!columnId && !stickerId && !assignedTo && !titleContains) {
+      return text("Нужен хотя бы один фильтр: columnId, stickerId, assignedTo или titleContains");
+    }
+
+    const qs: string[] = ["limit=100"];
+    if (columnId) qs.push(`columnId=${encodeURIComponent(columnId)}`);
+    if (stickerId) qs.push(`stickerId=${encodeURIComponent(stickerId)}`);
+    if (stickerStateId) qs.push(`stickerStateId=${encodeURIComponent(stickerStateId)}`);
+    if (assignedTo) qs.push(`assignedTo=${encodeURIComponent(assignedTo)}`);
+    if (titleContains) qs.push(`title=${encodeURIComponent(titleContains)}`);
+
+    const [data, stickerMap] = await Promise.all([
+      api("GET", `/tasks?${qs.join("&")}`) as Promise<{
+        content?: Array<{
+          id: string;
+          idTaskCommon?: string;
+          title: string;
+          deadline?: { deadline?: number };
+          timestamp?: number;
+          assigned?: string[];
+          stickers?: Record<string, string>;
+        }>
+      }>,
+      getStickerMap()
+    ]);
+
     const tasks = data.content || [];
     if (!tasks.length) return text("Задачи не найдены");
     const list = tasks.map(t => {
@@ -186,10 +248,8 @@ server.registerTool(
       if (t.timestamp) row += ` | создана: ${formatDate(t.timestamp)}`;
       if (t.deadline?.deadline) row += ` | дедлайн: ${formatDate(t.deadline.deadline)}`;
       if (t.assigned?.length) row += ` | исполнители: ${t.assigned.join(", ")}`;
-      if (t.stickers && Object.keys(t.stickers).length) {
-        const stickerStr = Object.entries(t.stickers).map(([k, v]) => `${k}:${v}`).join(", ");
-        row += ` | стикеры: ${stickerStr}`;
-      }
+      const st = describeStickers(t.stickers, stickerMap);
+      if (st) row += ` | ${st}`;
       return row;
     }).join("\n");
     return text(`Задачи (${tasks.length}):\n${list}`);
@@ -264,8 +324,8 @@ server.registerTool(
     if (data.completed !== undefined) lines.push(`Завершена: ${data.completed ? "да" : "нет"}`);
     if (data.assigned?.length) lines.push(`Исполнители: ${data.assigned.join(", ")}`);
     if (data.stickers && Object.keys(data.stickers).length) {
-      const stickerStr = Object.entries(data.stickers).map(([k, v]) => `${k}:${v}`).join(", ");
-      lines.push(`Стикеры: ${stickerStr}`);
+      const stickerMap = await getStickerMap();
+      lines.push(`Стикеры: ${describeStickers(data.stickers, stickerMap)}`);
     }
     lines.push("");
     if (data.description) {
@@ -601,7 +661,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.7.0" });
+    res.json({ status: "ok", service: "YouGile MCP Server", version: "4.8.0" });
   });
 
   app.post("/mcp", async (req, res) => {
@@ -616,7 +676,7 @@ async function main(): Promise<void> {
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`YouGile MCP сервер v4.7 запущен на порту ${PORT}`);
+    console.log(`YouGile MCP сервер v4.8 запущен на порту ${PORT}`);
   });
 }
 
