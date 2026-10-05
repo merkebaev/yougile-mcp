@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
+import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 const YOUGILE_KEY = process.env.YOUGILE_KEY || "";
 const BASE = "https://ru.yougile.com/api-v2";
@@ -664,7 +665,7 @@ async function main(): Promise<void> {
     res.json({ status: "ok", service: "YouGile MCP Server", version: "4.8.0" });
   });
 
-  app.post("/mcp", async (req, res) => {
+  const handleMcp = async (req: express.Request, res: express.Response) => {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true
@@ -672,7 +673,26 @@ async function main(): Promise<void> {
     res.on("close", () => transport.close());
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
-  });
+  };
+
+  // Доступ к MCP. Коннекторы claude.ai не умеют передавать свой заголовок с токеном,
+  // поэтому секрет — в адресе: /mcp/<MCP_PATH_TOKEN>. Без переменной — старый открытый /mcp (с предупреждением).
+  const PATH_TOKEN = process.env.MCP_PATH_TOKEN || "";
+  if (PATH_TOKEN) {
+    const expected = Buffer.from(PATH_TOKEN);
+    app.post("/mcp/:token", async (req, res) => {
+      const got = Buffer.from(String(req.params.token || ""));
+      if (got.length !== expected.length || !timingSafeEqual(got, expected)) {
+        res.status(404).json({ error: "not found" });
+        return;
+      }
+      await handleMcp(req, res);
+    });
+    app.post("/mcp", (_req, res) => { res.status(404).json({ error: "not found" }); });
+  } else {
+    console.warn("ВНИМАНИЕ: MCP_PATH_TOKEN не задан — /mcp открыт для всех, кто знает адрес сервера");
+    app.post("/mcp", handleMcp);
+  }
 
   const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => {
